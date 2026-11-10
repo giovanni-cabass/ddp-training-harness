@@ -23,9 +23,9 @@ def verify_model_dtype_fp32(model: torch.nn.Module) -> None:
     """Refuse to compute Fisher on a checkpoint whose weights aren't fp32.
 
     Training here runs in plain fp32 throughout, not mixed precision (no
-    autocast/bf16/fp16) -- for a model sized for time-series forecasting
-    rather than a language model, there's no memory pressure forcing a move
-    to reduced-precision weights. This isn't a throughput sacrifice on
+    autocast/bf16/fp16) -- a model this small doesn't have the memory
+    footprint that pushes something like a large language model toward
+    reduced-precision weights. This isn't a throughput sacrifice on
     modern GPUs either: TF32 matmul acceleration (a GPU compute mode, not a
     storage dtype -- every tensor is still genuinely torch.float32 at the
     level this check inspects) gets most of the speed benefit of reduced
@@ -43,12 +43,30 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=None)
     parser.add_argument("--num-batches", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Recompute even if --output already holds a Fisher payload for this exact checkpoint",
+    )
     args = parser.parse_args()
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     model = ToyRegressor()
     model.load_state_dict(checkpoint["model_state"])
     verify_model_dtype_fp32(model)
+    fingerprint = checkpoint_fingerprint(checkpoint["model_state"])
+
+    # Recomputing Fisher is the expensive part of this script -- if --output
+    # already holds a payload fingerprinted to this exact checkpoint, treat
+    # the job as already done (mirrors the real pipeline's restart-safe skip).
+    if args.output.exists() and not args.overwrite:
+        try:
+            FisherPayload.load_matching(args.output, expected_fingerprint=fingerprint)
+        except Exception:
+            pass  # unreadable, or fingerprint mismatch -- fall through and recompute
+        else:
+            print(f"{args.output} already holds a Fisher payload for this checkpoint -- skipping (pass --overwrite to force).")
+            return
 
     # Fisher must describe curvature of the loss the checkpoint actually
     # trained on -- same --data-dir/seed as train.py, restricted to the
@@ -61,7 +79,7 @@ def main() -> None:
     fisher_diag = compute_fisher_diag(model, loader, loss_fn, num_batches=args.num_batches)
     payload = FisherPayload(
         fisher_diag=fisher_diag,
-        checkpoint_fingerprint=checkpoint_fingerprint(checkpoint["model_state"]),
+        checkpoint_fingerprint=fingerprint,
         source_step=checkpoint.get("step", -1),
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)

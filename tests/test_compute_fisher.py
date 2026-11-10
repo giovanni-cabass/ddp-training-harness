@@ -59,3 +59,71 @@ def test_compute_fisher_cli_uses_data_dir_and_train_only_split(tmp_path, monkeyp
 
     payload = FisherPayload.load(output_path)
     assert payload.checkpoint_fingerprint == checkpoint_fingerprint(checkpoint["model_state"])
+
+
+def _make_checkpoint_and_data(tmp_path):
+    data_dir = tmp_path / "data"
+    materialize_synthetic_shard(data_dir, num_samples=20, input_dim=16, seed=0)
+    model = ToyRegressor()
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    torch.save({"model_state": model.state_dict(), "step": 3}, checkpoint_path)
+    return checkpoint_path, data_dir
+
+
+def test_compute_fisher_cli_skips_recompute_when_output_already_matches(tmp_path, monkeypatch, capsys):
+    checkpoint_path, data_dir = _make_checkpoint_and_data(tmp_path)
+    output_path = tmp_path / "fisher.pt"
+    argv = [
+        "compute_fisher.py",
+        "--checkpoint", str(checkpoint_path),
+        "--output", str(output_path),
+        "--data-dir", str(data_dir),
+        "--batch-size", "4",
+    ]
+
+    monkeypatch.setattr(sys, "argv", argv)
+    compute_fisher.main()  # first run actually computes it
+
+    call_count = 0
+    real_compute_fisher_diag = compute_fisher.compute_fisher_diag
+
+    def spy(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return real_compute_fisher_diag(*args, **kwargs)
+
+    monkeypatch.setattr(compute_fisher, "compute_fisher_diag", spy)
+    monkeypatch.setattr(sys, "argv", argv)
+    compute_fisher.main()  # second run should skip -- same checkpoint, same output
+
+    assert call_count == 0
+    assert "skipping" in capsys.readouterr().out
+
+
+def test_compute_fisher_cli_overwrite_forces_recompute(tmp_path, monkeypatch):
+    checkpoint_path, data_dir = _make_checkpoint_and_data(tmp_path)
+    output_path = tmp_path / "fisher.pt"
+    argv = [
+        "compute_fisher.py",
+        "--checkpoint", str(checkpoint_path),
+        "--output", str(output_path),
+        "--data-dir", str(data_dir),
+        "--batch-size", "4",
+    ]
+
+    monkeypatch.setattr(sys, "argv", argv)
+    compute_fisher.main()
+
+    call_count = 0
+    real_compute_fisher_diag = compute_fisher.compute_fisher_diag
+
+    def spy(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return real_compute_fisher_diag(*args, **kwargs)
+
+    monkeypatch.setattr(compute_fisher, "compute_fisher_diag", spy)
+    monkeypatch.setattr(sys, "argv", argv + ["--overwrite"])
+    compute_fisher.main()
+
+    assert call_count == 1

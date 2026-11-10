@@ -9,6 +9,10 @@
 # afterward -- regardless of how the job ends -- keeps node-local scratch
 # from leaking across jobs on a machine other people also use.
 #
+# The real pipeline splits this into separate stage / cleanup scripts
+# chained by a driver; this demo fuses staging, the training invocation,
+# and cleanup into one script.
+#
 # Env vars (all optional):
 #   SRC_DATA_DIR   where the prepared data already lives (shared storage).
 #                  If unset, a synthetic shard is materialized to stand in
@@ -20,12 +24,32 @@
 # Any extra args are forwarded to train.py, e.g.:
 #   ./stage_and_run.sh --phase 1 --world-size 2 --epochs 5
 
-set -eo pipefail
+set -euo pipefail
 
 JOB_ID="${SLURM_JOB_ID:-$$}"
 SCRATCH_BASE="${SCRATCH_BASE:-${SLURM_TMPDIR:-/tmp/$USER/ddp_harness_$JOB_ID}}"
-STAGE_DIR="$SCRATCH_BASE/data"
 SRC_DATA_DIR="${SRC_DATA_DIR:-}"
+
+# Reject relative paths before resolving anything: a relative SCRATCH_BASE
+# would otherwise resolve against whatever directory the script happens to
+# be invoked from, making its safety meaning depend on the caller's cwd
+# rather than on the value itself.
+case "$SCRATCH_BASE" in
+  /*) ;;
+  *)
+    echo "ERROR: refusing to use SCRATCH_BASE='$SCRATCH_BASE' -- must be an absolute path." >&2
+    exit 2
+    ;;
+esac
+
+# Canonicalize before the safety check below: resolves ".."/symlinks, so an
+# absolute-looking value that doesn't textually match the check (e.g.
+# "/foo/../$HOME-basename") can't resolve to something unsafe and slip past
+# it anyway. Uses Python (already a hard dependency here) rather than
+# `realpath`, since BSD realpath (macOS) lacks GNU's `-m` flag for a path
+# that doesn't fully exist yet.
+SCRATCH_BASE="$(python -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$SCRATCH_BASE")"
+STAGE_DIR="$SCRATCH_BASE/data"
 
 # The space check below uses GNU-only du/df flags. On Linux (the real
 # target: a SLURM cluster, or CI's ubuntu-latest) plain du/df already are
@@ -41,9 +65,13 @@ pick_gnu_tool() {
   candidate="$(command -v "$1" 2>/dev/null || true)"
   if [[ -n "$candidate" ]] && "$candidate" --version 2>/dev/null | grep -qi "GNU coreutils"; then
     echo "$candidate"
-  else
-    command -v "$2"
+    return 0
   fi
+  if ! command -v "$2" >/dev/null 2>&1; then
+    echo "ERROR: neither '$1' nor '$2' found on PATH." >&2
+    exit 2
+  fi
+  command -v "$2"
 }
 DU_CMD="$(pick_gnu_tool gdu du)"
 DF_CMD="$(pick_gnu_tool gdf df)"
@@ -82,11 +110,18 @@ if [[ -z "$SRC_DATA_DIR" ]]; then
   echo "SRC_DATA_DIR not set -- materializing a synthetic shard to stand in for a real export."
   SRC_DATA_DIR="$SCRATCH_BASE/source"
   python data.py --output-dir "$SRC_DATA_DIR"
+elif [[ ! -d "$SRC_DATA_DIR" ]]; then
+  echo "ERROR: SRC_DATA_DIR='$SRC_DATA_DIR' does not exist or is not a directory." >&2
+  exit 2
 fi
 
 echo "Checking available scratch space..."
 src_bytes="$("$DU_CMD" -sb "$SRC_DATA_DIR" | awk '{print $1}')"
 avail_bytes="$("$DF_CMD" -B1 --output=avail "$SCRATCH_BASE" | awk 'NR==2 {print $1}')"
+if [[ -z "$src_bytes" || -z "$avail_bytes" ]]; then
+  echo "ERROR: unable to determine source size or available scratch space." >&2
+  exit 2
+fi
 if (( src_bytes > avail_bytes )); then
   echo "ERROR: not enough scratch space (need $src_bytes bytes, have $avail_bytes)." >&2
   exit 2

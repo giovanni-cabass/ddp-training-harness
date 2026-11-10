@@ -30,6 +30,7 @@ def test_compute_fisher_diag_shapes_match_parameters():
     fisher = compute_fisher_diag(model, loader, nn.MSELoss())
     for name, p in model.named_parameters():
         assert fisher[name].shape == p.shape
+        assert fisher[name].dtype == p.dtype  # cast back from the float64 accumulator
         assert torch.all(fisher[name] >= 0)
 
 
@@ -91,6 +92,59 @@ def test_ewc_penalty_is_zero_at_reference_point():
     assert ewc.penalty().item() > 0.0
 
 
+def test_ewc_rejects_missing_fisher_parameters():
+    model = _tiny_model()
+    fisher = {name: torch.ones_like(p) for name, p in model.named_parameters()}
+    del fisher["bias"]
+    with pytest.raises(ValueError, match="missing parameters"):
+        ElasticWeightConsolidation(model, fisher, importance=1.0)
+
+
+def test_ewc_rejects_extra_fisher_parameters():
+    model = _tiny_model()
+    fisher = {name: torch.ones_like(p) for name, p in model.named_parameters()}
+    fisher["not_a_real_param"] = torch.ones(1)
+    with pytest.raises(ValueError, match="aren't trainable parameters"):
+        ElasticWeightConsolidation(model, fisher, importance=1.0)
+
+
+def test_ewc_clips_outlier_and_mean_normalizes_fisher():
+    model = _tiny_model()
+    weight_fisher = torch.tensor([[1.0, 1.0, 1.0, 1000.0]])
+    bias_fisher = torch.tensor([1.0])
+    fisher = {"weight": weight_fisher, "bias": bias_fisher}
+
+    raw_flat = torch.cat([weight_fisher.reshape(-1), bias_fisher.reshape(-1)])
+    unclipped_normalized_outlier = (1000.0 / raw_flat.mean()).item()
+
+    ewc = ElasticWeightConsolidation(model, fisher, importance=1.0, clip_percentile=80.0)
+
+    processed_flat = torch.cat([t.reshape(-1) for t in ewc.fisher_diag.values()])
+    assert torch.isclose(processed_flat.mean(), torch.tensor(1.0), atol=1e-5)
+
+    outlier_value = ewc.fisher_diag["weight"][0, 3].item()
+    assert outlier_value < unclipped_normalized_outlier  # clipping actually reduced it
+
+    small_values = torch.cat([ewc.fisher_diag["weight"][0, :3], ewc.fisher_diag["bias"]])
+    assert torch.allclose(small_values, small_values[0].expand_as(small_values))
+
+
+def test_ewc_rejects_invalid_clip_percentile():
+    model = _tiny_model()
+    fisher = {name: torch.ones_like(p) for name, p in model.named_parameters()}
+    with pytest.raises(ValueError, match="clip_percentile"):
+        ElasticWeightConsolidation(model, fisher, clip_percentile=0.0)
+    with pytest.raises(ValueError, match="clip_percentile"):
+        ElasticWeightConsolidation(model, fisher, clip_percentile=150.0)
+
+
+def test_ewc_rejects_all_zero_fisher():
+    model = _tiny_model()
+    fisher = {name: torch.zeros_like(p) for name, p in model.named_parameters()}
+    with pytest.raises(RuntimeError, match="Post-clip Fisher mean"):
+        ElasticWeightConsolidation(model, fisher)
+
+
 def test_swa_state_ships_whichever_candidate_actually_wins():
     model = _tiny_model()
     swa = SwaState(model=model)
@@ -116,3 +170,30 @@ def test_swa_state_ships_whichever_candidate_actually_wins():
     shipped = swa.pick_shipping_state(fake_evaluate)
     shipped_value = next(iter(shipped.values())).flatten()[0].item()
     assert shipped_value == 2.0
+
+
+def test_swa_state_seeded_with_prior_best_wont_ship_a_regression():
+    """run_phase2 seeds SwaState's best with the resumed checkpoint's own
+    recorded loss -- otherwise, if neither the SWA average nor anything
+    seen during phase 2 beats that starting point, pick_shipping_state
+    would still ship one of them anyway: a regression against what phase 1
+    already achieved. This mirrors that seeding directly on SwaState.
+    """
+    model = _tiny_model()
+    with torch.no_grad():
+        for p in model.parameters():
+            p.fill_(1.0)
+    phase1_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+    swa = SwaState(model=model)
+    swa.consider_best(selection_metric=0.1)  # the phase-1 checkpoint's own recorded loss
+
+    with torch.no_grad():
+        for p in model.parameters():
+            p.fill_(99.0)  # phase 2 made things much worse
+    swa.update_average()
+
+    shipped = swa.pick_shipping_state(evaluate_fn=lambda _state: 50.0)  # worse than 0.1 either way
+
+    for name, value in shipped.items():
+        assert torch.equal(value, phase1_state[name]), name

@@ -36,10 +36,28 @@ def compute_fisher_diag(
     quantity than the mean of per-sample squared gradients, and the gap is
     worst exactly where Fisher/EWC matters most: near a converged checkpoint,
     where individual-sample gradients are non-zero but their mean is close
-    to zero.
+    to zero. The running sum itself is kept in float64 and cast back to each
+    parameter's own dtype only at the end (see below).
+
+    Two mechanical differences from the real pipeline this generalizes, not
+    just a reimplementation of it: it saves its Fisher payload in float64
+    and leaves the downcast to the consumer at load time, whereas this
+    downcasts before ever saving; and it takes a deterministic row-stride
+    subsampling parameter and asserts it visited every expected training
+    row exactly once, whereas `num_batches` here is a plain cutoff with no
+    equivalent coverage check.
     """
     model.eval()
-    fisher = {name: torch.zeros_like(p) for name, p in model.named_parameters() if p.requires_grad}
+    # Accumulate in float64, not each parameter's own (fp32) dtype: summing
+    # many per-sample squared-gradient terms means every addition rounds the
+    # running total to fp32's ~7 decimal digits, and that rounding error
+    # compounds over hundreds/thousands of summands -- float64 has enough
+    # extra headroom that that compounding stays negligible across the whole
+    # sum. Cast back to the parameter's own dtype at the end, so the result
+    # matches the live model weights the EWC penalty is actually applied to.
+    fisher = {
+        name: torch.zeros_like(p, dtype=torch.float64) for name, p in model.named_parameters() if p.requires_grad
+    }
     seen = 0
     for batch_idx, (inputs, targets) in enumerate(data_loader):
         if num_batches is not None and batch_idx >= num_batches:
@@ -51,16 +69,26 @@ def compute_fisher_diag(
             loss.backward()
             for name, p in model.named_parameters():
                 if p.grad is not None:
-                    fisher[name] += p.grad.detach() ** 2
+                    fisher[name] += p.grad.detach().double() ** 2
             seen += 1
     model.zero_grad(set_to_none=True)
     if seen == 0:
         raise ValueError("compute_fisher_diag: data_loader produced no batches")
-    return {name: tensor / seen for name, tensor in fisher.items()}
+    param_dtypes = {name: p.dtype for name, p in model.named_parameters()}
+    return {name: (tensor / seen).to(param_dtypes[name]) for name, tensor in fisher.items()}
 
 
 def checkpoint_fingerprint(state_dict: Dict[str, torch.Tensor]) -> str:
-    """Cheap, order-stable fingerprint of a state dict, for the Fisher provenance check."""
+    """Cheap, order-stable fingerprint of a state dict, for the Fisher provenance check.
+
+    A different mechanism than the real pipeline this generalizes, not just
+    a reimplementation of it: the real provenance check matches on
+    descriptive metadata (a checkpoint filename and a few bookkeeping
+    fields), not a hash of the weights themselves. This hashes the actual
+    tensor bytes, so it also catches a checkpoint silently overwritten with
+    different weights under the same filename -- a stronger check, but a
+    different one.
+    """
     hasher = hashlib.sha256()
     for name in sorted(state_dict.keys()):
         tensor = state_dict[name]
@@ -127,7 +155,13 @@ class ElasticWeightConsolidation:
     loss = task_loss + (importance / 2) * sum_i F_i * (w_i - w_i_ref)^2
     """
 
-    def __init__(self, model: nn.Module, fisher_diag: Dict[str, torch.Tensor], importance: float = 1.0) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        fisher_diag: Dict[str, torch.Tensor],
+        importance: float = 1.0,
+        clip_percentile: float = 99.0,
+    ) -> None:
         trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
         missing = trainable_names - fisher_diag.keys()
         if missing:
@@ -136,11 +170,37 @@ class ElasticWeightConsolidation:
                 "this Fisher payload doesn't match the model; refusing to silently skip the EWC "
                 "penalty for those parameters."
             )
+        extra = fisher_diag.keys() - trainable_names
+        if extra:
+            raise ValueError(
+                f"ElasticWeightConsolidation: fisher_diag has entries for {sorted(extra)}, which aren't "
+                "trainable parameters of this model -- this Fisher payload doesn't match the model it's "
+                "being applied to."
+            )
+        if not (0.0 < clip_percentile <= 100.0):
+            raise ValueError(f"clip_percentile must be in (0, 100], got {clip_percentile}")
+
+        # Clip the top percentile across the whole Fisher map, then
+        # mean-normalize: without this, a handful of parameters with huge
+        # Fisher values dominate the penalty and wash out everything else,
+        # and the raw Fisher scale drifts from run to run -- normalizing
+        # after clipping keeps `importance` meaning roughly the same
+        # magnitude of penalty regardless of checkpoint/run.
+        flat = torch.cat([t.reshape(-1) for t in fisher_diag.values()])
+        threshold = torch.quantile(flat, clip_percentile / 100.0)
+        clipped = {name: torch.clamp(t, max=threshold) for name, t in fisher_diag.items()}
+        flat_clipped = torch.cat([t.reshape(-1) for t in clipped.values()])
+        mean_clipped = flat_clipped.mean()
+        if not torch.isfinite(mean_clipped) or mean_clipped <= 0:
+            raise RuntimeError(
+                f"Post-clip Fisher mean must be finite and > 0 for normalization, got {mean_clipped.item()}"
+            )
+        self.fisher_diag = {name: t / mean_clipped for name, t in clipped.items()}
+
         self.model = model
-        self.fisher_diag = fisher_diag
         self.importance = importance
         self.reference_params = {
-            name: p.detach().clone() for name, p in model.named_parameters() if name in fisher_diag
+            name: p.detach().clone() for name, p in model.named_parameters() if name in self.fisher_diag
         }
 
     def penalty(self) -> torch.Tensor:
@@ -167,6 +227,17 @@ class SwaState:
     The two don't always agree on which to ship: compare them on the
     selection metric and keep whichever actually wins, rather than assuming
     the average is better by construction.
+
+    Averages the whole state_dict (parameters and buffers alike) with plain
+    running-mean arithmetic, instead of using PyTorch's own
+    `torch.optim.swa_utils.AveragedModel` the way the real pipeline this
+    generalizes does. `AveragedModel` averages only `parameters()` and
+    copies buffers through unchanged; this class's hand-rolled version
+    doesn't make that distinction, so a non-floating-point buffer (e.g. a
+    BatchNorm running-stats counter) would error or silently average
+    incorrectly. `ToyRegressor` has no buffers, so this never triggers
+    here -- but it's a gap specific to reimplementing the averaging by
+    hand, not one the real pipeline has.
     """
 
     model: nn.Module
@@ -196,7 +267,12 @@ class SwaState:
     def pick_shipping_state(
         self, evaluate_fn: Callable[[Dict[str, torch.Tensor]], float]
     ) -> Dict[str, torch.Tensor]:
-        """Evaluate the average against the recorded best (lower is better); return the winner."""
+        """Evaluate the average against the recorded best (lower is better); return the winner.
+
+        Automates a comparison that was a separate offline analysis step,
+        done after training finished, in the real pipeline this
+        generalizes -- not something the training script itself decided.
+        """
         if self.average_state is None:
             if self.best_state is None:
                 raise ValueError("SwaState.pick_shipping_state: no snapshots recorded yet")

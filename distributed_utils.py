@@ -2,10 +2,13 @@
 
 This module holds the patterns that make long, unattended multi-GPU (or
 CPU/gloo) training jobs survive the failure modes that matter in practice:
-a stalled rank, a dtype/shape/NaN problem visible on only one rank, a
-SIGTERM from a job scheduler enforcing a walltime limit, and a crash
-mid-checkpoint. None of the functions below are specific to any particular
-model or dataset.
+a rank that goes silent mid-collective (e.g. because a dtype/shape/NaN bug
+that only shows up on that rank's data crashed it), a SIGTERM from a job
+scheduler enforcing a walltime limit, and a crash mid-checkpoint. Nothing
+here validates for a dtype/shape/NaN bug directly -- it makes the stall
+that bug causes diagnosable (which rank, which collective) instead of an
+indefinite hang. None of the functions below are specific to any
+particular model or dataset.
 """
 
 from __future__ import annotations
@@ -31,6 +34,18 @@ def resolve_backend() -> str:
 
 
 def find_free_port() -> int:
+    """Probe an ephemeral port and release it for the workers to bind to.
+
+    A demo-only addition, not present in the real pipeline this
+    generalizes: that system hardcodes nccl with a fixed, externally
+    configured port, no runtime discovery at all. This exists purely so
+    the demo can run standalone, repeatedly, without a scheduler assigning
+    a port -- and it has an accepted, unmitigated TOCTOU race (another
+    process could grab this exact port between the probe and the workers'
+    actual bind). Deliberately left unmitigated rather than patched further:
+    fixing it properly would mean retry/consensus machinery on top of an
+    addition that already doesn't exist in the original.
+    """
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
         sock.bind(("", 0))
         return sock.getsockname()[1]
@@ -57,11 +72,18 @@ def setup_process_group(rank: int, world_size: int, backend: str, master_port: i
     global _MONITOR_GROUP
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ["MASTER_PORT"] = str(master_port)
-    hang_debug_log(rank, "pre init_process_group")
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-    hang_debug_log(rank, "post init_process_group")
+    # Bind the device before rendezvous, not after: NCCL communicator setup
+    # can use the current device as part of init, so setting it only after
+    # init_process_group (the previous ordering here) is less defensive than
+    # necessary -- untested either way, since CI only ever exercises gloo.
+    device_id = None
     if backend == "nccl":
         torch.cuda.set_device(rank)
+        device_id = torch.device("cuda", rank)
+    hang_debug_log(rank, "pre init_process_group")
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size, device_id=device_id)
+    hang_debug_log(rank, "post init_process_group")
+    if backend == "nccl":
         _MONITOR_GROUP = dist.new_group(backend="gloo")
     else:
         _MONITOR_GROUP = None  # default group is already gloo; it supports monitored_barrier directly
@@ -86,21 +108,32 @@ def teardown_process_group(timeout_seconds: float = 30.0) -> None:
     teardown forever -- after the timeout we destroy the process group
     regardless of whether every rank actually reached it.
     """
+    global _MONITOR_GROUP
     if not dist.is_initialized():
         return
     rank = dist.get_rank()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        except Exception as cuda_exc:
+            print(f"Rank {rank}: CUDA sync/cache clear during teardown failed: {cuda_exc}", flush=True)
     monitored_barrier("teardown", rank, timeout_seconds=timeout_seconds)
+    if _MONITOR_GROUP is not None:
+        dist.destroy_process_group(_MONITOR_GROUP)
+        _MONITOR_GROUP = None
     dist.destroy_process_group()
 
 
 def install_graceful_shutdown_handler(on_signal: Callable[[], None]) -> None:
     """Register SIGTERM/SIGINT handlers that run `on_signal` once.
 
-    A SLURM walltime kill sends SIGTERM before the hard SIGKILL. The primary
-    resume point is whatever checkpoint was last saved when the selection
-    metric improved; this handler adds one extra checkpoint-and-clean-teardown
-    attempt as a safety net for the rarer case where the kill lands between
-    improvement checks, rather than losing that partial epoch outright. A
+    A SLURM walltime kill sends SIGTERM before the hard SIGKILL. Resume
+    always happens from whatever checkpoint was last saved when the
+    selection metric improved -- this handler doesn't save an extra
+    checkpoint on its own behalf, it just gives the training loop a chance
+    to stop cleanly (finish the current step, tear down the process group)
+    before the hard kill lands, instead of being killed mid-collective. A
     second signal is not re-handled -- by then we're already on our way out.
     """
     handled = {"done": False}
@@ -116,29 +149,24 @@ def install_graceful_shutdown_handler(on_signal: Callable[[], None]) -> None:
     signal.signal(signal.SIGINT, _handler)
 
 
-def broadcast_exit_on_mismatch(local_ok: bool, rank: int, device: torch.device) -> bool:
-    """All-reduce a per-rank health flag; return True iff every rank is healthy.
-
-    Used to catch a dtype/shape/NaN problem that only one rank can see (e.g.
-    a corrupt shard, a bad batch) and have every rank exit together, instead
-    of the healthy ranks deadlocking on the next collective waiting for a
-    peer that already bailed out.
-    """
-    flag = torch.tensor([0 if local_ok else 1], dtype=torch.int32, device=device)
-    dist.all_reduce(flag, op=dist.ReduceOp.SUM)
-    any_unhealthy = bool(flag.item() > 0)
-    if any_unhealthy and local_ok:
-        print(f"[rank {rank}] another rank reported unhealthy; exiting together", flush=True)
-    return not any_unhealthy
-
-
 @dataclass
 class CheckpointHandoff:
     """Rank-0 crash-safe checkpoint writer.
 
     Writes to a temp path and renames into place with os.replace (atomic on
     POSIX), so a crash mid-write never leaves a corrupt checkpoint that a
-    resumed job would load.
+    resumed job would load. Applied consistently to every checkpoint write
+    here, broader than strictly necessary -- a deliberate strengthening of
+    the pattern, not a claim that it matches any one real system verbatim.
+
+    Two more differences from the real pipeline this generalizes: its own
+    checkpoint writes save a bare state_dict with no wrapper, with step and
+    metric bookkeeping kept in a separate external run log instead of
+    inside the checkpoint file -- this wraps every save in a dict that
+    embeds that bookkeeping directly. And it keeps only one "best" file
+    (overwritten in place); this additionally keeps a uniquely numbered
+    archival file on every improvement, a full history the real pipeline
+    doesn't.
     """
 
     checkpoint_dir: Path
@@ -148,7 +176,12 @@ class CheckpointHandoff:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     def save(self, state: dict, step: int) -> None:
-        for target_name in (f"checkpoint_step{step:08d}.pt", "latest.pt"):
+        # Each file's own write is atomic (temp + os.replace), but the pair
+        # isn't jointly atomic -- a crash between the two leaves one of them
+        # stale. Write latest.pt first: everything downstream (compute_fisher.py,
+        # --resume-from, CI) reads latest.pt, so a crash in that gap should cost
+        # the archival per-step file, never leave the actual resume point stale.
+        for target_name in ("latest.pt", f"checkpoint_step{step:08d}.pt"):
             final_path = self.checkpoint_dir / target_name
             tmp_path = final_path.with_suffix(final_path.suffix + ".tmp")
             try:
@@ -157,9 +190,3 @@ class CheckpointHandoff:
             except Exception:
                 tmp_path.unlink(missing_ok=True)
                 raise
-
-    def load_latest(self) -> Optional[dict]:
-        latest_path = self.checkpoint_dir / "latest.pt"
-        if not latest_path.exists():
-            return None
-        return torch.load(latest_path, map_location="cpu", weights_only=True)
