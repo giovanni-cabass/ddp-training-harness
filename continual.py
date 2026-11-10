@@ -26,10 +26,17 @@ def compute_fisher_diag(
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     num_batches: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Diagonal Fisher-information estimate: mean squared gradient per parameter.
+    """Diagonal Fisher-information estimate: mean of *per-sample* squared gradients.
 
     Single-process, read-only with respect to the model's weights (grads are
     cleared when done). `num_batches=None` consumes the whole loader once.
+
+    Gradients are accumulated one sample at a time, not as a batch mean --
+    squaring a batch-mean gradient is a different, systematically smaller
+    quantity than the mean of per-sample squared gradients, and the gap is
+    worst exactly where Fisher/EWC matters most: near a converged checkpoint,
+    where individual-sample gradients are non-zero but their mean is close
+    to zero.
     """
     model.eval()
     fisher = {name: torch.zeros_like(p) for name, p in model.named_parameters() if p.requires_grad}
@@ -37,14 +44,15 @@ def compute_fisher_diag(
     for batch_idx, (inputs, targets) in enumerate(data_loader):
         if num_batches is not None and batch_idx >= num_batches:
             break
-        model.zero_grad(set_to_none=True)
-        predictions = model(inputs)
-        loss = loss_fn(predictions, targets)
-        loss.backward()
-        for name, p in model.named_parameters():
-            if p.grad is not None:
-                fisher[name] += p.grad.detach() ** 2
-        seen += 1
+        for i in range(inputs.size(0)):
+            model.zero_grad(set_to_none=True)
+            prediction = model(inputs[i : i + 1])
+            loss = loss_fn(prediction, targets[i : i + 1])
+            loss.backward()
+            for name, p in model.named_parameters():
+                if p.grad is not None:
+                    fisher[name] += p.grad.detach() ** 2
+            seen += 1
     model.zero_grad(set_to_none=True)
     if seen == 0:
         raise ValueError("compute_fisher_diag: data_loader produced no batches")
@@ -76,15 +84,19 @@ class FisherPayload:
     def save(self, path: Path) -> None:
         path = Path(path)
         tmp_path = path.with_suffix(path.suffix + ".tmp")
-        torch.save(
-            {
-                "fisher_diag": self.fisher_diag,
-                "checkpoint_fingerprint": self.checkpoint_fingerprint,
-                "source_step": self.source_step,
-            },
-            tmp_path,
-        )
-        tmp_path.replace(path)
+        try:
+            torch.save(
+                {
+                    "fisher_diag": self.fisher_diag,
+                    "checkpoint_fingerprint": self.checkpoint_fingerprint,
+                    "source_step": self.source_step,
+                },
+                tmp_path,
+            )
+            tmp_path.replace(path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
 
     @classmethod
     def load(cls, path: Path) -> "FisherPayload":
@@ -116,6 +128,14 @@ class ElasticWeightConsolidation:
     """
 
     def __init__(self, model: nn.Module, fisher_diag: Dict[str, torch.Tensor], importance: float = 1.0) -> None:
+        trainable_names = {name for name, p in model.named_parameters() if p.requires_grad}
+        missing = trainable_names - fisher_diag.keys()
+        if missing:
+            raise ValueError(
+                f"ElasticWeightConsolidation: fisher_diag is missing parameters {sorted(missing)} -- "
+                "this Fisher payload doesn't match the model; refusing to silently skip the EWC "
+                "penalty for those parameters."
+            )
         self.model = model
         self.fisher_diag = fisher_diag
         self.importance = importance

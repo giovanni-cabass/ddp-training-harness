@@ -3,10 +3,15 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -15,4 +20,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       - name: Run tests (CPU only, gloo backend)
-        run: pytest -v
+        run: python -m pytest -v
+      - name: Run stage_and_run.sh end-to-end (CPU, 1 simulated rank)
+        run: ./stage_and_run.sh --world-size 1 --phase 1 --epochs 1 --checkpoint-dir checkpoints
+      - name: Compute a Fisher payload from the phase-1 checkpoint
+        run: python compute_fisher.py --checkpoint checkpoints/latest.pt --output checkpoints/fisher.pt
+      - name: Run phase 2 (EWC + SWA) end-to-end
+        run: python train.py --phase 2 --world-size 1 --swa-epochs 1 --resume-from checkpoints/latest.pt --fisher-payload checkpoints/fisher.pt --checkpoint-dir checkpoints

@@ -96,10 +96,12 @@ def teardown_process_group(timeout_seconds: float = 30.0) -> None:
 def install_graceful_shutdown_handler(on_signal: Callable[[], None]) -> None:
     """Register SIGTERM/SIGINT handlers that run `on_signal` once.
 
-    This is what makes a SLURM walltime kill (which sends SIGTERM before the
-    hard SIGKILL) safe: the handler's job is to let the current step finish
-    and checkpoint before the grace period expires. A second signal is not
-    re-handled -- by then we're already on our way out.
+    A SLURM walltime kill sends SIGTERM before the hard SIGKILL. The primary
+    resume point is whatever checkpoint was last saved when the selection
+    metric improved; this handler adds one extra checkpoint-and-clean-teardown
+    attempt as a safety net for the rarer case where the kill lands between
+    improvement checks, rather than losing that partial epoch outright. A
+    second signal is not re-handled -- by then we're already on our way out.
     """
     handled = {"done": False}
 
@@ -149,8 +151,12 @@ class CheckpointHandoff:
         for target_name in (f"checkpoint_step{step:08d}.pt", "latest.pt"):
             final_path = self.checkpoint_dir / target_name
             tmp_path = final_path.with_suffix(final_path.suffix + ".tmp")
-            torch.save(state, tmp_path)
-            os.replace(tmp_path, final_path)
+            try:
+                torch.save(state, tmp_path)
+                os.replace(tmp_path, final_path)
+            except Exception:
+                tmp_path.unlink(missing_ok=True)
+                raise
 
     def load_latest(self) -> Optional[dict]:
         latest_path = self.checkpoint_dir / "latest.pt"

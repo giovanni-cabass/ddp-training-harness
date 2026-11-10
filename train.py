@@ -124,18 +124,25 @@ def run_phase1(rank: int, world_size: int, device: torch.device, args: argparse.
 
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
-        local_ok = True
+        aborted = False
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            if not torch.isfinite(inputs).all() or not torch.isfinite(targets).all():
-                local_ok = False
+            # Check health -- a collective call -- before the step that triggers
+            # DDP's own collectives, on every iteration. Checking only once per
+            # epoch (after the loop) lets a rank that hits bad data break out of
+            # its local loop early while healthy ranks keep calling backward()
+            # without it, deadlocking on the next all-reduce instead of exiting
+            # together.
+            local_ok = bool(torch.isfinite(inputs).all() and torch.isfinite(targets).all())
+            healthy = broadcast_exit_on_mismatch(local_ok, rank, device)
+            if not healthy:
+                if rank == 0:
+                    print(f"[epoch {epoch}] a rank reported bad data; aborting all ranks together", flush=True)
+                aborted = True
                 break
             microbatched_step(ddp_model, optimizer, loss_fn, inputs, targets, args.microbatch_size)
 
-        healthy = broadcast_exit_on_mismatch(local_ok, rank, device)
-        if not healthy:
-            if rank == 0:
-                print(f"[epoch {epoch}] a rank reported bad data; aborting all ranks together", flush=True)
+        if aborted:
             break
 
         monitored_barrier(f"epoch-{epoch}-end", rank)

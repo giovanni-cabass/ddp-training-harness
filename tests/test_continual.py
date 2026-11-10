@@ -33,6 +33,33 @@ def test_compute_fisher_diag_shapes_match_parameters():
         assert torch.all(fisher[name] >= 0)
 
 
+def test_compute_fisher_diag_matches_mean_of_per_sample_squared_gradients():
+    """Regression test: squaring a batch-mean gradient instead of averaging
+    per-sample squared gradients is a different, systematically smaller
+    quantity. Verify against a closed-form per-sample gradient with
+    batch_size > 1, where the two diverge, and confirm the result is NOT the
+    (wrong) batch-mean-then-square quantity either.
+    """
+    model = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(0.5)
+
+    xs = torch.tensor([[1.0], [2.0], [3.0], [-1.0]])
+    ys = torch.tensor([[2.0], [1.0], [0.0], [1.0]])
+    loader = [(xs, ys)]  # one batch holding all 4 samples
+    fisher = compute_fisher_diag(model, loader, nn.MSELoss())
+
+    w = model.weight.item()
+    # MSELoss(reduction="mean") over a single sample with 1 output element is
+    # (w*x - y)^2, so d(loss)/dw = 2*x*(w*x - y) per sample.
+    per_sample_grads = [2 * x.item() * (w * x.item() - y.item()) for x, y in zip(xs, ys)]
+    expected = sum(g**2 for g in per_sample_grads) / len(per_sample_grads)
+    assert fisher["weight"].item() == pytest.approx(expected, rel=1e-5)
+
+    wrong_quantity = (sum(per_sample_grads) / len(per_sample_grads)) ** 2
+    assert fisher["weight"].item() != pytest.approx(wrong_quantity, rel=1e-5)
+
+
 def test_fisher_payload_provenance_rejects_mismatched_checkpoint():
     model = _tiny_model()
     fisher = {name: torch.ones_like(p) for name, p in model.named_parameters()}

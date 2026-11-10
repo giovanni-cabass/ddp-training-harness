@@ -27,6 +27,27 @@ SCRATCH_BASE="${SCRATCH_BASE:-${SLURM_TMPDIR:-/tmp/$USER/ddp_harness_$JOB_ID}}"
 STAGE_DIR="$SCRATCH_BASE/data"
 SRC_DATA_DIR="${SRC_DATA_DIR:-}"
 
+# The space check below uses GNU-only du/df flags. On Linux (the real
+# target: a SLURM cluster, or CI's ubuntu-latest) plain du/df already are
+# the GNU versions. On macOS they're the BSD versions and don't support
+# these flags -- but macOS's GNU coreutils (from Homebrew or MacPorts) are
+# commonly installed as gdu/gdf precisely so they don't clobber the
+# system's own du/df, so prefer those if present rather than requiring the
+# caller to rearrange PATH. Verify it's actually GNU coreutils first: "gdu"
+# also names an unrelated, independently popular disk-usage browser, and a
+# false match there would fail confusingly rather than falling through.
+pick_gnu_tool() {
+  local candidate
+  candidate="$(command -v "$1" 2>/dev/null || true)"
+  if [[ -n "$candidate" ]] && "$candidate" --version 2>/dev/null | grep -qi "GNU coreutils"; then
+    echo "$candidate"
+  else
+    command -v "$2"
+  fi
+}
+DU_CMD="$(pick_gnu_tool gdu du)"
+DF_CMD="$(pick_gnu_tool gdf df)"
+
 # Refuse to stage into, or clean up, anything that doesn't look like
 # disposable scratch space. A misconfigured or unset scratch variable
 # should fail loudly, never silently operate on a persistent directory.
@@ -41,12 +62,21 @@ STAGE_DONE=0
 cleanup_on_exit() {
   if [[ "$STAGE_DONE" -eq 1 ]]; then
     echo "Cleaning up scratch: $SCRATCH_BASE"
-    rm -rf "$SCRATCH_BASE"
+    # Guarded with `|| true`: this runs from an EXIT trap under `set -e`, and a
+    # trap's own failing last command overrides the exit status that triggered
+    # it -- a transient rm failure (busy mount, stale handle) must never mask
+    # a real training success or a more informative earlier failure.
+    rm -rf "$SCRATCH_BASE" || true
   fi
 }
 trap cleanup_on_exit EXIT
 
 mkdir -p "$SCRATCH_BASE"
+# Mark staged as of here, not after rsync succeeds below: anything that fails
+# from this point on (synthetic-shard materialization, the space check,
+# rsync itself) has still created real content under $SCRATCH_BASE that must
+# be cleaned up on exit, not left behind because STAGE_DONE never flipped.
+STAGE_DONE=1
 
 if [[ -z "$SRC_DATA_DIR" ]]; then
   echo "SRC_DATA_DIR not set -- materializing a synthetic shard to stand in for a real export."
@@ -55,8 +85,8 @@ if [[ -z "$SRC_DATA_DIR" ]]; then
 fi
 
 echo "Checking available scratch space..."
-src_bytes="$(du -sb "$SRC_DATA_DIR" | awk '{print $1}')"
-avail_bytes="$(df -B1 --output=avail "$SCRATCH_BASE" | awk 'NR==2 {print $1}')"
+src_bytes="$("$DU_CMD" -sb "$SRC_DATA_DIR" | awk '{print $1}')"
+avail_bytes="$("$DF_CMD" -B1 --output=avail "$SCRATCH_BASE" | awk 'NR==2 {print $1}')"
 if (( src_bytes > avail_bytes )); then
   echo "ERROR: not enough scratch space (need $src_bytes bytes, have $avail_bytes)." >&2
   exit 2
@@ -64,8 +94,7 @@ fi
 echo "Space check OK."
 
 echo "Staging $SRC_DATA_DIR -> $STAGE_DIR"
-rsync -a --info=progress2 "$SRC_DATA_DIR/" "$STAGE_DIR/"
-STAGE_DONE=1
+rsync -a "$SRC_DATA_DIR/" "$STAGE_DIR/"
 
 echo "Running training against staged data..."
 python train.py --data-dir "$STAGE_DIR" "$@"

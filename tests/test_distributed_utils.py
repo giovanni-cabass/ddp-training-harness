@@ -10,6 +10,9 @@ from pathlib import Path
 import torch
 import torch.multiprocessing as mp
 
+import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 from distributed_utils import (
     CheckpointHandoff,
     broadcast_exit_on_mismatch,
@@ -18,6 +21,7 @@ from distributed_utils import (
     setup_process_group,
     teardown_process_group,
 )
+from train import microbatched_step
 
 
 def _run_worker(rank, world_size, master_port, target, result_dir, extra) -> None:
@@ -80,6 +84,52 @@ def test_checkpoint_handoff_survives_crash_mid_write(tmp_path):
     handoff = CheckpointHandoff(checkpoint_dir)
     loaded = handoff.load_latest()
     assert loaded == {"value": 42}
+
+
+def _lockstep_bad_batch_worker(rank, world_size, extra):
+    """Mirrors train.py run_phase1's per-iteration pattern: check health (a
+    collective) before the step that triggers DDP's own collectives, on
+    every iteration. Only rank 0 ever sees bad data, and only at one
+    iteration -- every rank must abort at that exact same iteration, having
+    taken the exact same number of training steps beforehand.
+    """
+    model = nn.Linear(4, 1)
+    ddp_model = DDP(model)
+    optimizer = torch.optim.SGD(ddp_model.parameters(), lr=1e-3)
+    loss_fn = nn.MSELoss()
+
+    num_iterations = 5
+    bad_at_iteration = 2
+    steps_taken = 0
+    aborted_at = None
+    for i in range(num_iterations):
+        inputs = torch.randn(4, 4)
+        targets = torch.randn(4, 1)
+        if rank == 0 and i == bad_at_iteration:
+            inputs[0, 0] = float("nan")
+
+        local_ok = bool(torch.isfinite(inputs).all() and torch.isfinite(targets).all())
+        healthy = broadcast_exit_on_mismatch(local_ok, rank, device=torch.device("cpu"))
+        if not healthy:
+            aborted_at = i
+            break
+        microbatched_step(ddp_model, optimizer, loss_fn, inputs, targets, microbatch_size=2)
+        steps_taken += 1
+
+    return {"rank": rank, "steps_taken": steps_taken, "aborted_at": aborted_at}
+
+
+def test_lockstep_health_check_prevents_rank_divergence(tmp_path):
+    """Regression test for a real deadlock bug: when the health check ran only
+    once per epoch (after the batch loop), a rank that saw bad data could
+    break out of its local loop before its peers learned about it, leaving
+    the healthy ranks still issuing DDP collective calls the exited rank no
+    longer matched -- a hang. Checking before every step keeps every rank in
+    lockstep on the number of collective calls issued either way.
+    """
+    results = _spawn_and_collect(_lockstep_bad_batch_worker, world_size=2, result_dir=tmp_path)
+    assert all(r["aborted_at"] == 2 for r in results), results
+    assert all(r["steps_taken"] == 2 for r in results), results
 
 
 def test_graceful_shutdown_handler_runs_once():
