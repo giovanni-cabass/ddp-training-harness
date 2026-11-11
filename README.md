@@ -10,37 +10,39 @@ training jobs on a shared cluster with PyTorch's DDP (DistributedDataParallel)
 — built to survive the failure modes that actually show up in practice, not
 just the happy path.
 
+## Development note
+
+Both the real shared-cluster training system this repo generalizes, and
+this public demo's implementation — writing the code, debugging it, and
+several rounds of automated code review — were built with substantial help
+from AI coding tools, Claude Code and Cursor.
+
 ## Why this exists
 
-On a shared SLURM-style cluster, a training job usually doesn't end because
-training finished — it ends because the walltime budget ran out. I lean into
-that constraint rather than fighting it: instead of early-stopping on a
-patience window, I estimate epochs-per-hour for a given architecture/dataset
-by hand, offline, before submitting the job, and budget walltime accordingly
-— no script computes this for me. The job runs until the scheduler kills
-it, and the next one resumes from a checkpoint. Early stopping has a
-sharper failure mode too, in my experience: a loss curve can plateau, look
-converged, and then undergo a genuine transition to a lower plateau later on
-— a patience window tuned for the first plateau stops before ever seeing
-the second.
+I train models with PyTorch's DDP (DistributedDataParallel) across multiple
+GPUs on a shared, SLURM-style cluster — real, multi-day jobs, not
+single-process scripts. This harness is the set of patterns that keeps
+those jobs reliable:
 
-This resume-after-walltime-kill approach only works if the harness can
-(a) tell when something has gone quietly wrong on one rank instead of
-hanging forever, and (b) not lose the run to the walltime kill. Checkpointing
-every time the selection metric improves is what actually makes the run
-recoverable; the `SIGTERM` signal SLURM sends before the hard kill triggers
-a handler that doesn't save anything on its own — it just lets the current
-step finish and the process group tear down cleanly instead of being killed
-mid-collective. (That handler relies on the OS delivering the signal
-directly to each worker process, true under a SLURM job kill; a `SIGTERM`
-sent only to the top-level `python train.py` process wouldn't reach the
-workers it spawns.)
-
-The same shared-cluster reality shapes how data gets to the job, too:
-`stage_and_run.sh` copies input data to node-local scratch before training
-starts and cleans it up on any exit, so a multi-epoch job doesn't hammer a
-shared filesystem with repeated random-access reads, and nothing lingers on
-a compute node other people also use.
+- **Resume-after-walltime-kill, not early stopping.** A shared cluster kills
+  the job when its walltime budget runs out, not when training "finishes,"
+  so I estimate epochs-per-hour by hand, offline, and budget walltime
+  accordingly — no script computes this for me. The next job just resumes
+  from a checkpoint. (Early stopping has its own sharp failure mode here,
+  in my experience: a loss curve can plateau, look converged, and later
+  drop to a genuinely lower plateau — a patience window tuned for the first
+  plateau never sees the second.)
+- **Resuming is only meaningful if the harness knows when something's
+  actually wrong.** A monitored barrier catches a rank that's hung instead
+  of waiting on it forever; checkpointing on every selection-metric
+  improvement is what makes a resume worth anything; the `SIGTERM` handler
+  SLURM sends before the hard kill just lets the current step finish and the
+  process group tear down cleanly, instead of dying mid-collective.
+- **Node-local data staging.** `stage_and_run.sh` copies input data to
+  node-local scratch before training starts and cleans it up on any exit,
+  so a multi-epoch job doesn't hammer a shared filesystem with repeated
+  random-access reads, and nothing lingers on a compute node other people
+  also use.
 
 ## What's inside
 
