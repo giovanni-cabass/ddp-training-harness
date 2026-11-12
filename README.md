@@ -15,7 +15,10 @@ just the happy path.
 Both the real shared-cluster training system this repo generalizes, and
 this public demo's implementation — writing the code, debugging it, and
 several rounds of automated code review — were built with substantial help
-from AI coding tools, Claude Code and Cursor.
+from AI coding tools: Claude Code and Cursor for the cluster work, and
+Claude Code for this public demo.
+
+(Earlier commits were missing the git trailer so GitHub never recognized Claude Code as co-author.)
 
 ## Why this exists
 
